@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 import time
+import math
 
 from google.adk.plugins import base_plugin
 from google.genai import types
@@ -18,8 +19,18 @@ class RateLimitPlugin(base_plugin.BasePlugin):
 
     def __init__(self, max_requests: int = 10, window_seconds: int = 60):
         super().__init__(name="rate_limiter")
-        self.max_requests = max_requests
-        self.window_seconds = window_seconds
+        # Fail fast on invalid configuration.  Without this, NaN/negative
+        # values can silently disable the limiter or produce ``nan`` wait
+        # messages, which is unsafe for a security boundary.
+        try:
+            parsed_limit = int(max_requests)
+            parsed_window = float(window_seconds)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("max_requests and window_seconds must be numeric") from exc
+        if parsed_limit < 1 or not math.isfinite(parsed_window) or parsed_window <= 0:
+            raise ValueError("max_requests must be >= 1 and window_seconds must be finite and > 0")
+        self.max_requests = parsed_limit
+        self.window_seconds = parsed_window
         self.user_windows: dict[str, deque] = defaultdict(deque)
         self.blocked_count = 0
         self.total_count = 0
@@ -37,13 +48,13 @@ class RateLimitPlugin(base_plugin.BasePlugin):
         now = time.time()
         window = self.user_windows[user_id]
 
-        # TODO: Implement sliding window:
-        # 1. Pop timestamps older than (now - window_seconds) from the left
-        # 2. If len(window) >= max_requests:
-        #       wait = window_seconds - (now - window[0])
-        #       self.blocked_count += 1
-        #       return self._block_response(
-        #           f"Rate limit exceeded. Try again in {wait:.0f}s."
-        #       )
-        # 3. Else: append now, return None
-        raise NotImplementedError("Implement RateLimitPlugin.on_user_message_callback")
+        cutoff = now - self.window_seconds
+        while window and window[0] <= cutoff:
+            window.popleft()
+        limit = self.max_requests
+        if len(window) >= limit:
+            wait = max(0.0, float(self.window_seconds) - (now - window[0]))
+            self.blocked_count += 1
+            return self._block_response(f"Rate limit exceeded. Try again in {wait:.0f}s.")
+        window.append(now)
+        return None

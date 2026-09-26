@@ -6,6 +6,13 @@ Checkpoint 2 — Output Guardrails
 """
 import re
 import textwrap
+import base64
+import unicodedata
+import codecs
+import binascii
+import html
+import json
+from urllib.parse import unquote
 
 from google.genai import types
 from google.adk.agents import llm_agent
@@ -13,6 +20,7 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+from core.config import DEMO_SECRETS
 
 
 # ============================================================
@@ -36,24 +44,135 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
-    issues = []
+    response = "" if response is None else str(response)
+    issues: list[str] = []
     redacted = response
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+    # Patterns are deliberately conservative around public banking data.  In
+    # particular, a spaced public hotline (1900 545 467) is not treated as a
+    # customer phone number, while 10/11 digit Vietnamese mobile/landline
+    # numbers are.
+    pii_patterns = {
+        "phone": r"(?<!\d)0(?:\d[ .-]?){8,9}\d(?!\d)",
+        "email": r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])",
+        "national_id": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
+        "api_key": r"(?<![A-Za-z0-9])sk-[A-Za-z0-9][A-Za-z0-9._-]{5,}(?![A-Za-z0-9])",
+        "password": r"(?<!\w)(?:password|passcode|mật\s*khẩu)\s*(?:is|là|[:=])\s*[^\s,;]+",
+        "internal_db": r"(?<![\w.-])(?:[\w-]+\.)*vinbank\.internal(?::\d{1,5})?(?![\w.-])",
     }
 
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    # Exact lab values and a punctuation/spacing-insensitive form catch leaks
+    # that do not use an obvious ``password=`` label.
+    exact_secrets = [s for s in DEMO_SECRETS if s]
+    compact_secret_forms = {
+        re.sub(r"[^a-z0-9]", "", s.casefold()): s
+        for s in exact_secrets
+        if re.sub(r"[^a-z0-9]", "", s.casefold())
+    }
+
+    def add_issue(name: str, count: int = 1) -> None:
+        label = f"{name}: {count} found"
+        if not any(item.startswith(f"{name}:") for item in issues):
+            issues.append(label)
+
+    for name, pattern in pii_patterns.items():
+        matches = list(re.finditer(pattern, response, re.IGNORECASE))
         if matches:
-            issues.append(f"{name}: {len(matches)} found")
+            add_issue(name, len(matches))
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    for secret in exact_secrets:
+        if secret.casefold() in response.casefold():
+            add_issue("secret")
+            redacted = re.sub(re.escape(secret), "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Detect values split by punctuation or spaces (for example ``sk-vinbank-
+    # secret-2024``).  This is done after ordinary redaction and only for
+    # known protected values, so it does not over-redact normal prose.
+    normalized_response = unicodedata.normalize("NFKC", response)
+    compact_response = re.sub(r"[^a-z0-9]", "", normalized_response.casefold())
+    for compact, original in compact_secret_forms.items():
+        if compact and compact in compact_response:
+            add_issue("secret")
+            obfuscated = r"\W*".join(re.escape(ch) for ch in original)
+            redacted = re.sub(obfuscated, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            # If a Unicode variant (for example full-width digits) cannot be
+            # represented by the direct regex, fail closed for the complete
+            # response rather than returning a partially leaked value.
+            if compact in re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", redacted).casefold()):
+                redacted = "[REDACTED]"
+
+    # JSON unicode escapes are another presentation layer frequently used to
+    # hide credentials (for example ``\\u0061dmin123``). Decode only when the
+    # whole response is a JSON string, preserving ordinary prose exactly.
+    decoded_json = None
+    try:
+        parsed_json = json.loads(response)
+        if isinstance(parsed_json, str):
+            decoded_json = parsed_json
+    except (ValueError, TypeError):
+        pass
+
+    # Check common presentation/transport encodings. A response is only
+    # classified as a leak when the decoded form contains a known secret;
+    # harmless encoded customer text is left alone.
+    decoded_outputs = [html.unescape(unquote(response))]
+    if decoded_json is not None:
+        decoded_outputs.append(decoded_json)
+    try:
+        decoded_outputs.append(codecs.decode(response, "rot_13"))
+    except (LookupError, UnicodeError):
+        pass
+    for token in re.findall(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/])", response):
+        try:
+            decoded_outputs.append(base64.b64decode(token, validate=True).decode("utf-8", "ignore"))
+        except (ValueError, UnicodeError):
+            pass
+    for token in re.findall(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{16,}(?![A-Fa-f0-9])", response):
+        try:
+            decoded_outputs.append(binascii.unhexlify(token).decode("utf-8", "ignore"))
+        except (binascii.Error, ValueError, UnicodeError):
+            pass
+    for decoded in decoded_outputs:
+        # The original response is already covered by the direct regex and
+        # compact-secret checks above. Only classify a value as encoded when
+        # it actually came from a transformed representation; otherwise a
+        # plain secret would be mislabeled as an ``encoded_secret``.
+        if decoded == response:
+            continue
+        normalized_decoded = unicodedata.normalize("NFKC", decoded).casefold()
+        compact_decoded = re.sub(r"[^a-z0-9]", "", normalized_decoded)
+        if any(compact and compact in compact_decoded for compact in compact_secret_forms):
+            add_issue("encoded_secret")
+            redacted = "[REDACTED]"
+            break
+
+    # A JSON object can carry the same value in a field whose name is not
+    # ``password``.  Inspect serialized JSON values through the same compact
+    # comparison; this catches unicode-escaped and punctuation-split secrets
+    # without blocking harmless JSON responses.
+    if not issues:
+        try:
+            parsed = json.loads(response)
+            serialized = json.dumps(parsed, ensure_ascii=False)
+            compact_json = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", serialized).casefold())
+            if any(compact and compact in compact_json for compact in compact_secret_forms):
+                add_issue("encoded_secret")
+                redacted = "[REDACTED]"
+        except (ValueError, TypeError):
+            pass
+
+    # Common reversible encoding bypass used by red teams.  Only classify a
+    # decoded token as a leak when it contains a known secret; arbitrary
+    # base64 text is not blocked.
+    for token in re.findall(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/])", response):
+        try:
+            decoded = base64.b64decode(token, validate=True).decode("utf-8", "ignore")
+        except (ValueError, UnicodeError):
+            continue
+        if any(secret.casefold() in decoded.casefold() for secret in exact_secrets):
+            add_issue("encoded_secret")
+            redacted = redacted.replace(token, "[REDACTED]")
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +291,35 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            # Secret/configuration leaks fail closed.  PII-only responses can
+            # be safely preserved with deterministic redaction.
+            issue_names = {item.split(":", 1)[0] for item in filtered["issues"]}
+            if issue_names & {"secret", "encoded_secret", "api_key", "password", "internal_db"}:
+                replacement = (
+                    "I cannot share internal system details or sensitive personal data. "
+                    "How else can I help with your VinBank account or banking needs?"
+                )
+                self.blocked_count += 1
+            else:
+                replacement = filtered["redacted"]
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=replacement)]
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judged = await llm_safety_check(response_text)
+            if not judged.get("safe", True):
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="I can't safely provide that response. I can help with VinBank banking questions."
+                    )],
+                )
+        return llm_response
 
 
 # ============================================================
